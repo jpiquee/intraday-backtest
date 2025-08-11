@@ -1,4 +1,4 @@
-import os, time, random
+import os, time, random, json
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -9,12 +9,14 @@ import requests
 from backtest_engine import Backtester, ExecutionModel
 from strategies import IntradayMeanReversion, IntradayBreakout
 
-TICKERS = ["QQQ", "SPY", "NVDA", "BTC-USD", "EURUSD=X"]
+# --- CONFIG ---
+TICKERS = ["QQQ", "SPY", "NVDA", "^GDAXI", "GC=F", "CL=F", "BTC-USD", "EURUSD=X"]
 INITIAL_EQUITY = 1000.0
 RISK_FRACTION = 0.01
 MAX_LEVERAGE = 2.0
 BREAKOUT_LOOKBACK = 10
 BREAKOUT_COOLDOWN = 5
+# ---------------
 
 OUT_ROOT = "outputs"
 DOC_ROOT = "docs"
@@ -26,6 +28,11 @@ os.makedirs(ASSET_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 ALPHAVANTAGE_KEY = os.environ.get("ALPHAVANTAGE_KEY", "").strip()
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+def is_us_equity(t):
+    return t in {"QQQ","SPY","NVDA"}
 
 def dl_5m_yf(ticker: str, tries: int = 6, wait_base: int = 10):
     last_err = None
@@ -58,7 +65,7 @@ def dl_5m_yf(ticker: str, tries: int = 6, wait_base: int = 10):
                     except Exception:
                         pass
                     df["datetime"] = s
-                if ticker not in ("BTC-USD",) and not ticker.endswith("=X") and "datetime" in df.columns:
+                if is_us_equity(ticker) and "datetime" in df.columns:
                     df = df[(df["datetime"].dt.time >= pd.to_datetime("09:35").time()) &
                             (df["datetime"].dt.time <= pd.to_datetime("16:00").time())].reset_index(drop=True)
                 if not df.empty and "datetime" in df.columns:
@@ -89,7 +96,7 @@ def dl_5m_av_equity(symbol: str, api_key: str):
     j = r.json()
     key = "Time Series (5min)"
     if key not in j:
-        raise RuntimeError(f"Alpha Vantage equity error: {j.get('Note') or j.get('Error Message') or 'unknown'}")
+        raise RuntimeError(f"Alpha Vantage equity error: {j.get('Note') or {j.get('Error Message')} or 'unknown'}")
     ts = j[key]
     rows = []
     for ts_str, v in ts.items():
@@ -116,7 +123,7 @@ def dl_5m_av_crypto(symbol: str, market: str, api_key: str):
     j = r.json()
     key = "Time Series Crypto (5min)"
     if key not in j:
-        raise RuntimeError(f"Alpha Vantage crypto error: {j.get('Note') or j.get('Error Message') or 'unknown'}")
+        raise RuntimeError(f"Alpha Vantage crypto error: {j.get('Note') or {j.get('Error Message')} or 'unknown'}")
     ts = j[key]
     rows = []
     for ts_str, v in ts.items():
@@ -143,7 +150,7 @@ def dl_5m_av_fx(pair: str, api_key: str):
     j = r.json()
     key = "Time Series FX (5min)"
     if key not in j:
-        raise RuntimeError(f"Alpha Vantage FX error: {j.get('Note') or j.get('Error Message') or 'unknown'}")
+        raise RuntimeError(f"Alpha Vantage FX error: {j.get('Note') or {j.get('Error Message')} or 'unknown'}")
     ts = j[key]
     rows = []
     for ts_str, v in ts.items():
@@ -164,8 +171,10 @@ def dl_5m(ticker: str):
                 df = dl_5m_av_crypto(sym, "USD", ALPHAVANTAGE_KEY)
             elif ticker.endswith("=X"):
                 df = dl_5m_av_fx(ticker, ALPHAVANTAGE_KEY)
-            else:
+            elif ticker in {"QQQ","SPY","NVDA"}:
                 df = dl_5m_av_equity(ticker, ALPHAVANTAGE_KEY)
+            else:
+                df = None
             if df is not None and not df.empty:
                 print(f"[INFO] Used Alpha Vantage for {ticker}")
                 return df
@@ -175,6 +184,8 @@ def dl_5m(ticker: str):
 
 def run_backtest(ticker: str, df: pd.DataFrame):
     if ticker in ("BTC-USD",) or ticker.endswith("=X"):
+        session_start, session_end = "00:00", "23:59"
+    elif ticker in {"GC=F","CL=F","^GDAXI"}:
         session_start, session_end = "00:00", "23:59"
     else:
         session_start, session_end = "09:35", "16:00"
@@ -205,6 +216,17 @@ def plot_equity(equity_df: pd.DataFrame, title: str, out_path: str):
     plt.savefig(out_path)
     plt.close()
 
+def latest_signal_for(strategy, df: pd.DataFrame):
+    if df is None or df.empty or len(df) < 25:
+        return "NA"
+    i = len(df) - 1
+    try:
+        sig = strategy.signal(i, df)
+    except Exception:
+        return "NA"
+    mapping = {"enter_long": "LONG", "enter_short": "SHORT", "exit": "EXIT", None: "HOLD"}
+    return mapping.get(sig, "HOLD")
+
 def build_report(all_results: dict, notes: list[str]):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     rows = []
@@ -216,70 +238,44 @@ def build_report(all_results: dict, notes: list[str]):
         trades = len(v['trades'])
         img = f"{ticker}_{strat}_equity.png"
         rows.append((ticker, strat, f"{ret:.2f}%", f"{mdd*100:.2f}%", trades, img))
-
     notes_html = "".join([f"<li>{n}</li>" for n in notes])
-
     if not rows:
-        html = f"""<!doctype html><html><head><meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Intraday Backtests</title></head><body style="font-family:system-ui;margin:16px">
-        <h2>Intraday Backtests (5-min) — auto report</h2>
-        <p>Generated: {now}</p>
-        <ul>{notes_html}</ul>
-        <p>No results (data unavailable or rate limited). Try again later.</p>
-        </body></html>"""
+        html = f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Intraday Backtests</title></head><body style='font-family:system-ui;margin:16px'><h2>Intraday Backtests (5-min) - auto report</h2><p>Generated: {now}</p><ul>{notes_html}</ul><p>No results (data unavailable or rate limited). Try again later.</p></body></html>"
         with open(os.path.join(DOC_ROOT, "index.html"), "w", encoding="utf-8") as f:
             f.write(html)
         return
-
     table_rows = "\n".join([
         f"<tr><td>{t}</td><td>{s}</td><td>{r}</td><td>{m}</td><td>{tr}</td><td><img src='assets/{img}' width='360'></td></tr>"
         for (t,s,r,m,tr,img) in rows
     ])
-    html = f"""
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Intraday Backtests</title>
-<style>
-body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }}
-table {{ border-collapse: collapse; width: 100%; }}
-th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-th {{ background: #f5f5f5; }}
-td img {{ max-width: 100%; height: auto; }}
-</style>
-</head>
-<body>
-<h2>Intraday Backtests (5-min) — auto report</h2>
-<p>Generated: {now}</p>
-<ul>{notes_html}</ul>
-<table>
-<thead><tr><th>Ticker</th><th>Strategy</th><th>Return (%)</th><th>Max DD (%)</th><th>#Trades</th><th>Equity</th></tr></thead>
-<tbody>
-{table_rows}
-</tbody>
-</table>
-<p>Data sources: Yahoo Finance (primary), Alpha Vantage fallback (equity/crypto/FX 5min). Execution: next bar open, 1bps slippage, 0.5 commission.</p>
-</body>
-</html>
-"""
+    html = f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Intraday Backtests</title><style>body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }} table {{ border-collapse: collapse; width: 100%; }} th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }} th {{ background: #f5f5f5; }} td img {{ max-width: 100%; height: auto; }} small code {{ background: #f0f0f0; padding: 2px 4px; border-radius: 4px; }}</style></head><body><h2>Intraday Backtests (5-min) - auto report</h2><p>Generated: {now}</p><ul>{notes_html}</ul><p><small>Signals JSON: <code>/signals.json</code> (refresh each run)</small></p><table><thead><tr><th>Ticker</th><th>Strategy</th><th>Return (%)</th><th>Max DD (%)</th><th>#Trades</th><th>Equity</th></tr></thead><tbody>{table_rows}</tbody></table><p>Data: Yahoo Finance primary; Alpha Vantage fallback for equities/crypto/FX (if API key set). Execution: next bar open, 1bps slippage, 0.5 commission.</p></body></html>"
     with open(os.path.join(DOC_ROOT, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
+
+def send_telegram(text: str):
+    if not TG_TOKEN or not TG_CHAT:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        payload = {"chat_id": TG_CHAT, "text": text}
+        r = requests.post(url, json=payload, timeout=20)
+        print("[INFO] Telegram status:", r.status_code, str(r.text)[:120])
+        return r.status_code == 200
+    except Exception as e:
+        print("[WARN] Telegram send failed:", e)
+        return False
 
 def main():
     notes = []
     summary = {}
+    signals = {}
     for idx, ticker in enumerate(TICKERS):
         if idx > 0:
             time.sleep(10 + random.randint(0, 10))
         df = dl_5m(ticker)
         cache_path = os.path.join(DATA_DIR, f"{ticker.replace('=','_')}_5m.csv")
-        used_cache = False
         if (df is None or df.empty) and os.path.exists(cache_path):
             df = pd.read_csv(cache_path, parse_dates=["datetime"])
-            used_cache = True
             notes.append(f"{ticker}: loaded from cache (API rate limited).")
         if df is None or df.empty:
             notes.append(f"{ticker}: no data available (APIs failed and no cache).")
@@ -290,10 +286,41 @@ def main():
             key = f"{ticker}__{strat_name}"
             summary[key] = res
             img_path = os.path.join(ASSET_DIR, f"{ticker}_{strat_name}_equity.png")
-            plot_equity(res['equity_curve'], f"{ticker} — {strat_name}", img_path)
-    build_report(summary, notes)
-    print("Done. Report at docs/index.html")
+            plot_equity(res['equity_curve'], f"{ticker} - {strat_name}", img_path)
 
+        sigs = {}
+        sigs["meanrev"] = latest_signal_for(IntradayMeanReversion(), df)
+        sigs["breakout"] = latest_signal_for(IntradayBreakout(lookback=BREAKOUT_LOOKBACK, cooldown_bars=BREAKOUT_COOLDOWN), df)
+        signals[ticker] = sigs
+
+    signals_obj = {"generated_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), "signals": signals}
+    sig_path = os.path.join(DOC_ROOT, "signals.json")
+    with open(sig_path, "w", encoding="utf-8") as f:
+        json.dump(signals_obj, f, ensure_ascii=False, indent=2)
+
+    prev_sig_path = os.path.join(DATA_DIR, "last_signals.json")
+    changed_msgs = []
+    prev = None
+    if os.path.exists(prev_sig_path):
+        try:
+            prev = json.load(open(prev_sig_path, "r", encoding="utf-8"))
+        except Exception:
+            prev = None
+    with open(prev_sig_path, "w", encoding="utf-8") as f:
+        json.dump(signals_obj, f, ensure_ascii=False, indent=2)
+
+    if prev and "signals" in prev:
+        for tkr, stratmap in signals.items():
+            for strat, val in stratmap.items():
+                old = prev["signals"].get(tkr, {}).get(strat, None)
+                if val != old and val in {"LONG","SHORT","EXIT"}:
+                    changed_msgs.append(f"{tkr} / {strat}: {old} -> {val}")
+
+    if changed_msgs:
+        send_telegram("Signals update:\n" + "\n".join(changed_msgs))
+
+    build_report(summary, notes)
+    print("Done. Report at docs/index.html and docs/signals.json")
 
 if __name__ == "__main__":
     main()

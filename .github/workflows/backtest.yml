@@ -3,7 +3,7 @@ name: Backtest
 on:
   workflow_dispatch:
   schedule:
-    - cron: '15 * * * *'
+    - cron: '15 * * * *'   # every hour at :15
 
 permissions:
   contents: write
@@ -34,13 +34,15 @@ jobs:
           time.sleep(t)
           PY
 
-      - name: Run backtests & generate report
+      - name: Run backtests & generate report + signals
         env:
           MPLBACKEND: Agg
           ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python auto_backtest.py
 
-      - name: Commit report to /docs
+      - name: Commit report to /docs (+ data cache)
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Auto backtest: ${{ github.run_id }}"

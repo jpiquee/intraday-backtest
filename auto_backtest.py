@@ -1,4 +1,4 @@
-import os, io, math, json, pytz
+import os, time
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -18,49 +18,60 @@ os.makedirs(DOC_ROOT, exist_ok=True)
 os.makedirs(ASSET_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-def dl_5m(ticker: str) -> pd.DataFrame:
-    df = yf.download(ticker, interval="5m", period="60d", auto_adjust=False, progress=False)
-    df = df.reset_index().rename(columns={
-        "Datetime":"datetime", "Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"
-    })
-    # yfinance may return timezone-aware timestamps
-    if 'datetime' in df.columns:
-        # Convert to US/Eastern for equities to filter RTH; keep UTC for crypto
-        if ticker != "BTC-USD":
-            try:
-                df['datetime'] = pd.to_datetime(df['datetime']).dt.tz_convert("America/New_York")
-            except Exception:
-                df['datetime'] = pd.to_datetime(df['datetime'])
-        else:
-            try:
-                df['datetime'] = pd.to_datetime(df['datetime']).dt.tz_convert("UTC")
-            except Exception:
-                df['datetime'] = pd.to_datetime(df['datetime'])
-        # Drop tz info for engine (naive)
-        df['datetime'] = df['datetime'].dt.tz_localize(None)
-    df = df[['datetime','open','high','low','close','volume']].dropna().reset_index(drop=True)
-    # Filter session for equities
-    if ticker != "BTC-USD":
-        df = df[(df['datetime'].dt.time >= pd.to_datetime("09:35").time()) & (df['datetime'].dt.time <= pd.to_datetime("16:00").time())].reset_index(drop=True)
-    return df
+def dl_5m(ticker: str, tries: int = 5, wait_base: int = 8):
+    """Télécharge 60j en 5-min via yfinance avec retries/backoff.
+    Retourne None si échec ou dataframe vide."""
+    last_err = None
+    for attempt in range(1, tries + 1):
+        try:
+            df = yf.download(
+                ticker,
+                interval="5m",
+                period="60d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            if df is not None and not df.empty:
+                df = df.reset_index()
+                for cand in ["Datetime", "Date", "index"]:
+                    if cand in df.columns:
+                        df = df.rename(columns={cand: "datetime"})
+                        break
+                df = df.rename(columns={
+                    "Open": "open", "High": "high", "Low": "low",
+                    "Close": "close", "Adj Close": "close", "Volume": "volume"
+                })
+                keep = [c for c in ["datetime","open","high","low","close","volume"] if c in df.columns]
+                df = df[keep].dropna().reset_index(drop=True)
+                if "datetime" in df.columns:
+                    s = pd.to_datetime(df["datetime"], errors="coerce")
+                    try:
+                        s = s.dt.tz_localize(None)
+                    except Exception:
+                        pass
+                    df["datetime"] = s
+                if ticker != "BTC-USD" and "datetime" in df.columns:
+                    df = df[(df["datetime"].dt.time >= pd.to_datetime("09:35").time()) &
+                            (df["datetime"].dt.time <= pd.to_datetime("16:00").time())].reset_index(drop=True)
+                if not df.empty and "datetime" in df.columns:
+                    return df
+                last_err = RuntimeError("Empty dataframe after cleaning")
+            else:
+                last_err = RuntimeError("Empty dataframe from yfinance")
+        except Exception as e:
+            last_err = e
+        time.sleep(wait_base * attempt)
+    print(f"[WARN] Failed to download {ticker}: {last_err}")
+    return None
 
 def run_backtest(ticker: str, df: pd.DataFrame):
-    # Set session according to asset
-    if ticker == "BTC-USD":
-        session_start, session_end = "00:00", "23:59"
-    else:
-        session_start, session_end = "09:35", "16:00"
-
+    session_start, session_end = ("00:00","23:59") if ticker == "BTC-USD" else ("09:35","16:00")
     exec_model = ExecutionModel(slippage_bps=1.0, commission_per_trade=0.5)
-    # Use 1000 initial equity to mirror Julien's target capital
     common = dict(initial_equity=1000.0, risk_fraction=0.01, max_leverage=2.0,
                   session_start=session_start, session_end=session_end)
-
     results = {}
-    for strat_name, strat in [
-        ("meanrev", IntradayMeanReversion()),
-        ("breakout", IntradayBreakout())
-    ]:
+    for strat_name, strat in [("meanrev", IntradayMeanReversion()), ("breakout", IntradayBreakout())]:
         bt = Backtester(df, exec_model, **common)
         res = bt.run(strat)
         out_folder = os.path.join(OUT_ROOT, f"{ticker}_{strat_name}")
@@ -86,7 +97,6 @@ def plot_equity(equity_df: pd.DataFrame, title: str, out_path: str):
     plt.close()
 
 def build_report(all_results: dict):
-    # Build index.html
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     rows = []
     for key, v in all_results.items():
@@ -97,15 +107,22 @@ def build_report(all_results: dict):
         trades = len(v['trades'])
         img = f"{ticker}_{strat}_equity.png"
         rows.append((ticker, strat, f"{ret:.2f}%", f"{mdd*100:.2f}%", trades, img))
-
-    # Simple HTML
-    table_rows = "\\n".join([
+    if not rows:
+        html = f"""<!doctype html><html><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Intraday Backtests</title></head><body style="font-family:system-ui;margin:16px">
+        <h2>Intraday Backtests (5-min) — rapport auto</h2>
+        <p>Généré: {now}</p>
+        <p>Aucun résultat disponible (données indisponibles ou rate limit). Relancez le workflow dans Actions.</p>
+        </body></html>"""
+        with open(os.path.join(DOC_ROOT, "index.html"), "w", encoding="utf-8") as f:
+            f.write(html)
+        return
+    table_rows = "\n".join([
         f"<tr><td>{t}</td><td>{s}</td><td>{r}</td><td>{m}</td><td>{tr}</td><td><img src='assets/{img}' width='380'></td></tr>"
         for (t,s,r,m,tr,img) in rows
     ])
-
-    html = f"""
-<!doctype html>
+    html = f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -138,12 +155,14 @@ def main():
     summary = {}
     for ticker in TICKERS:
         df = dl_5m(ticker)
+        if df is None or df.empty:
+            print(f"[WARN] Skipping {ticker} (no data).")
+            continue
         df.to_csv(os.path.join(DATA_DIR, f"{ticker}_5m.csv"), index=False)
         results = run_backtest(ticker, df)
         for strat_name, res in results.items():
             key = f"{ticker}__{strat_name}"
             summary[key] = res
-            # Plot equity
             img_path = os.path.join(ASSET_DIR, f"{ticker}_{strat_name}_equity.png")
             plot_equity(res['equity_curve'], f"{ticker} — {strat_name}", img_path)
     build_report(summary)

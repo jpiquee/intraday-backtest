@@ -1,12 +1,12 @@
 name: Backtest
 
 on:
-  workflow_dispatch:        # Lancement manuel
+  workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'      # Lancement automatique toutes les heures
+    - cron: '0 */3 * * *'   # toutes les 3 heures (évite rate limit)
 
 permissions:
-  contents: write           # Autorise le commit de résultats
+  contents: write
 
 jobs:
   run:
@@ -16,20 +16,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run backtests & generate report
         env:
-          MPLBACKEND: Agg    # Empêche les erreurs matplotlib en mode headless
+          MPLBACKEND: Agg
         run: python auto_backtest.py
-
       - name: Commit report to /docs
         uses: stefanzweifel/git-auto-commit-action@v5
         with:

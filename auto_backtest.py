@@ -1,4 +1,4 @@
-import os, time
+import os, time, random
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -18,9 +18,9 @@ os.makedirs(DOC_ROOT, exist_ok=True)
 os.makedirs(ASSET_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-def dl_5m(ticker: str, tries: int = 5, wait_base: int = 8):
-    """Télécharge 60j en 5-min via yfinance avec retries/backoff.
-    Retourne None si échec ou dataframe vide."""
+def dl_5m(ticker: str, tries: int = 8, wait_base: int = 10):
+    """Download 60d of 5m bars with retry/backoff.
+    Returns a DataFrame or None. If Yahoo is rate-limited, we'll fall back to cache later."""
     last_err = None
     for attempt in range(1, tries + 1):
         try:
@@ -61,7 +61,9 @@ def dl_5m(ticker: str, tries: int = 5, wait_base: int = 8):
                 last_err = RuntimeError("Empty dataframe from yfinance")
         except Exception as e:
             last_err = e
-        time.sleep(wait_base * attempt)
+        sleep_s = wait_base * attempt + random.randint(0, 8)
+        print(f"[INFO] Retry {attempt}/{tries} for {ticker} after {sleep_s}s due to: {last_err}")
+        time.sleep(sleep_s)
     print(f"[WARN] Failed to download {ticker}: {last_err}")
     return None
 
@@ -96,7 +98,7 @@ def plot_equity(equity_df: pd.DataFrame, title: str, out_path: str):
     plt.savefig(out_path)
     plt.close()
 
-def build_report(all_results: dict):
+def build_report(all_results: dict, notes: list[str]):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     rows = []
     for key, v in all_results.items():
@@ -107,17 +109,22 @@ def build_report(all_results: dict):
         trades = len(v['trades'])
         img = f"{ticker}_{strat}_equity.png"
         rows.append((ticker, strat, f"{ret:.2f}%", f"{mdd*100:.2f}%", trades, img))
+
+    notes_html = "".join([f"<li>{n}</li>" for n in notes])
+
     if not rows:
         html = f"""<!doctype html><html><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Intraday Backtests</title></head><body style="font-family:system-ui;margin:16px">
-        <h2>Intraday Backtests (5-min) — rapport auto</h2>
-        <p>Généré: {now}</p>
-        <p>Aucun résultat disponible (données indisponibles ou rate limit). Relancez le workflow dans Actions.</p>
+        <h2>Intraday Backtests (5-min) - rapport auto</h2>
+        <p>Genere: {now}</p>
+        <ul>{notes_html}</ul>
+        <p>Aucun resultat disponible (donnees indisponibles ou rate limit). Relancez le workflow dans Actions.</p>
         </body></html>"""
         with open(os.path.join(DOC_ROOT, "index.html"), "w", encoding="utf-8") as f:
             f.write(html)
         return
+
     table_rows = "\n".join([
         f"<tr><td>{t}</td><td>{s}</td><td>{r}</td><td>{m}</td><td>{tr}</td><td><img src='assets/{img}' width='380'></td></tr>"
         for (t,s,r,m,tr,img) in rows
@@ -136,15 +143,16 @@ th {{ background: #f5f5f5; }}
 </style>
 </head>
 <body>
-<h2>Intraday Backtests (5-min) — rapport auto</h2>
-<p>Généré: {now}</p>
+<h2>Intraday Backtests (5-min) - rapport auto</h2>
+<p>Genere: {now}</p>
+<ul>{notes_html}</ul>
 <table>
-<thead><tr><th>Ticker</th><th>Stratégie</th><th>Rendement (%)</th><th>Max Drawdown (%)</th><th>#Trades</th><th>Équity</th></tr></thead>
+<thead><tr><th>Ticker</th><th>Strategie</th><th>Rendement (%)</th><th>Max Drawdown (%)</th><th>#Trades</th><th>Equity</th></tr></thead>
 <tbody>
 {table_rows}
 </tbody>
 </table>
-<p>Données: yfinance (60 jours). Stratégies: Mean Reversion (RSI+Bollinger), Breakout (Donchian). Exécution: next bar open, slippage 1 bps, commission 0.5.</p>
+<p>Donnees: yfinance (60 jours). Strategies: Mean Reversion (RSI+Bollinger), Breakout (Donchian). Execution: next bar open, slippage 1 bps, commission 0.5.</p>
 </body>
 </html>
 """
@@ -152,20 +160,27 @@ th {{ background: #f5f5f5; }}
         f.write(html)
 
 def main():
+    notes = []
     summary = {}
-    for ticker in TICKERS:
+    for idx, ticker in enumerate(TICKERS):
+        if idx > 0:
+            time.sleep(12 + random.randint(0, 10))
         df = dl_5m(ticker)
+        cache_path = os.path.join(DATA_DIR, f"{ticker}_5m.csv")
+        if (df is None or df.empty) and os.path.exists(cache_path):
+            df = pd.read_csv(cache_path, parse_dates=["datetime"])
+            notes.append(f"{ticker}: donnees recuperees depuis le cache local (rate limit Yahoo).")
         if df is None or df.empty:
-            print(f"[WARN] Skipping {ticker} (no data).")
+            notes.append(f"{ticker}: aucune donnee disponible (echec download + pas de cache).")
             continue
-        df.to_csv(os.path.join(DATA_DIR, f"{ticker}_5m.csv"), index=False)
+        df.to_csv(cache_path, index=False)
         results = run_backtest(ticker, df)
         for strat_name, res in results.items():
             key = f"{ticker}__{strat_name}"
             summary[key] = res
             img_path = os.path.join(ASSET_DIR, f"{ticker}_{strat_name}_equity.png")
-            plot_equity(res['equity_curve'], f"{ticker} — {strat_name}", img_path)
-    build_report(summary)
+            plot_equity(res['equity_curve'], f"{ticker} - {strat_name}", img_path)
+    build_report(summary, notes)
     print("Done. Report at docs/index.html")
 
 if __name__ == "__main__":

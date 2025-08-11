@@ -3,7 +3,7 @@ name: Backtest
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */3 * * *'   # toutes les 3 heures (évite rate limit)
+    - cron: '5 */6 * * *'   # every 6 hours at xx:05
 
 permissions:
   contents: write
@@ -16,19 +16,32 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Anti-stampede jitter
+        run: |
+          python - << 'PY'
+          import random, time
+          t = random.randint(20,180)
+          print(f"Sleeping {t}s to avoid API rush...")
+          time.sleep(t)
+          PY
+
       - name: Run backtests & generate report
         env:
           MPLBACKEND: Agg
         run: python auto_backtest.py
+
       - name: Commit report to /docs
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Auto backtest: ${{ github.run_id }}"
           branch: ${{ github.ref_name }}
-          file_pattern: docs/** outputs/**
+          file_pattern: docs/** outputs/** data/**

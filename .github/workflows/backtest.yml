@@ -29,7 +29,7 @@ jobs:
         run: |
           python - << 'PY'
           import random, time
-          t = random.randint(20,180)
+          t = random.randint(10,120)
           print(f"Sleeping {t}s to avoid API rush...")
           time.sleep(t)
           PY
@@ -37,6 +37,7 @@ jobs:
       - name: Run backtests & generate report
         env:
           MPLBACKEND: Agg
+          ALPHAVANTAGE_KEY: ${{ secrets.ALPHAVANTAGE_KEY }}
         run: python auto_backtest.py
 
       - name: Commit report to /docs

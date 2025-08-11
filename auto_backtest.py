@@ -1,4 +1,4 @@
-import os, time, random, os
+import os, time, random
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -9,7 +9,13 @@ import requests
 from backtest_engine import Backtester, ExecutionModel
 from strategies import IntradayMeanReversion, IntradayBreakout
 
-TICKERS = ["QQQ", "BTC-USD"]
+TICKERS = ["QQQ", "SPY", "NVDA", "BTC-USD", "EURUSD=X"]
+INITIAL_EQUITY = 1000.0
+RISK_FRACTION = 0.01
+MAX_LEVERAGE = 2.0
+BREAKOUT_LOOKBACK = 10
+BREAKOUT_COOLDOWN = 5
+
 OUT_ROOT = "outputs"
 DOC_ROOT = "docs"
 ASSET_DIR = os.path.join(DOC_ROOT, "assets")
@@ -52,7 +58,7 @@ def dl_5m_yf(ticker: str, tries: int = 6, wait_base: int = 10):
                     except Exception:
                         pass
                     df["datetime"] = s
-                if ticker != "BTC-USD" and "datetime" in df.columns:
+                if ticker not in ("BTC-USD",) and not ticker.endswith("=X") and "datetime" in df.columns:
                     df = df[(df["datetime"].dt.time >= pd.to_datetime("09:35").time()) &
                             (df["datetime"].dt.time <= pd.to_datetime("16:00").time())].reset_index(drop=True)
                 if not df.empty and "datetime" in df.columns:
@@ -89,9 +95,8 @@ def dl_5m_av_equity(symbol: str, api_key: str):
     for ts_str, v in ts.items():
         rows.append([ts_str, float(v["1. open"]), float(v["2. high"]), float(v["3. low"]), float(v["4. close"]), float(v["5. volume"])])
     df = pd.DataFrame(rows, columns=["datetime","open","high","low","close","volume"])
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")  # AV is in US/Eastern for equities
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df = df.sort_values("datetime").reset_index(drop=True)
-    # Filter RTH 09:35-16:00
     df = df[(df["datetime"].dt.time >= pd.to_datetime("09:35").time()) &
             (df["datetime"].dt.time <= pd.to_datetime("16:00").time())].reset_index(drop=True)
     return df
@@ -117,21 +122,48 @@ def dl_5m_av_crypto(symbol: str, market: str, api_key: str):
     for ts_str, v in ts.items():
         rows.append([ts_str, float(v["1. open"]), float(v["2. high"]), float(v["3. low"]), float(v["4. close"]), float(v["5. volume"])])
     df = pd.DataFrame(rows, columns=["datetime","open","high","low","close","volume"])
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")  # AV crypto is UTC
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df = df.sort_values("datetime").reset_index(drop=True)
+    return df
+
+def dl_5m_av_fx(pair: str, api_key: str):
+    base = pair.split("=")[0]
+    from_symbol, to_symbol = base[:3], base[3:]
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "FX_INTRADAY",
+        "from_symbol": from_symbol,
+        "to_symbol": to_symbol,
+        "interval": "5min",
+        "outputsize": "full",
+        "apikey": api_key,
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    key = "Time Series FX (5min)"
+    if key not in j:
+        raise RuntimeError(f"Alpha Vantage FX error: {j.get('Note') or j.get('Error Message') or 'unknown'}")
+    ts = j[key]
+    rows = []
+    for ts_str, v in ts.items():
+        rows.append([ts_str, float(v["1. open"]), float(v["2. high"]), float(v["3. low"]), float(v["4. close"]), float(v["5. volume"])])
+    df = pd.DataFrame(rows, columns=["datetime","open","high","low","close","volume"])
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df = df.sort_values("datetime").reset_index(drop=True)
     return df
 
 def dl_5m(ticker: str):
-    # Try Yahoo
     df = dl_5m_yf(ticker)
     if df is not None and not df.empty:
         return df
-    # Fallback to Alpha Vantage if key present
     if ALPHAVANTAGE_KEY:
         try:
-            if ticker.endswith("-USD"):  # crypto
+            if ticker.endswith("-USD"):
                 sym = ticker.split("-")[0]
                 df = dl_5m_av_crypto(sym, "USD", ALPHAVANTAGE_KEY)
+            elif ticker.endswith("=X"):
+                df = dl_5m_av_fx(ticker, ALPHAVANTAGE_KEY)
             else:
                 df = dl_5m_av_equity(ticker, ALPHAVANTAGE_KEY)
             if df is not None and not df.empty:
@@ -139,23 +171,23 @@ def dl_5m(ticker: str):
                 return df
         except Exception as e:
             print(f"[WARN] Alpha Vantage fallback failed for {ticker}: {e}")
-    # else: rely on cache in main()
     return None
 
 def run_backtest(ticker: str, df: pd.DataFrame):
-    session_start, session_end = ("00:00","23:59") if ticker == "BTC-USD" else ("09:35","16:00")
+    if ticker in ("BTC-USD",) or ticker.endswith("=X"):
+        session_start, session_end = "00:00", "23:59"
+    else:
+        session_start, session_end = "09:35", "16:00"
     exec_model = ExecutionModel(slippage_bps=1.0, commission_per_trade=0.5)
-    common = dict(initial_equity=1000.0, risk_fraction=0.01, max_leverage=2.0,
+    common = dict(initial_equity=INITIAL_EQUITY, risk_fraction=RISK_FRACTION, max_leverage=MAX_LEVERAGE,
                   session_start=session_start, session_end=session_end)
     results = {}
-    for strat_name, strat in [("meanrev", IntradayMeanReversion()), ("breakout", IntradayBreakout())]:
-        bt = Backtester(df, exec_model, **common)
-        res = bt.run(strat)
-        out_folder = os.path.join(OUT_ROOT, f"{ticker}_{strat_name}")
-        os.makedirs(out_folder, exist_ok=True)
-        res['equity_curve'].to_csv(os.path.join(out_folder, "equity.csv"), index=False)
-        res['trades'].to_csv(os.path.join(out_folder, "trades.csv"), index=False)
-        results[strat_name] = res
+    bt1 = Backtester(df, exec_model, **common)
+    res1 = bt1.run(IntradayMeanReversion())
+    results["meanrev"] = res1
+    bt2 = Backtester(df, exec_model, **common)
+    res2 = bt2.run(IntradayBreakout(lookback=BREAKOUT_LOOKBACK, cooldown_bars=BREAKOUT_COOLDOWN))
+    results["breakout"] = res2
     return results
 
 def max_drawdown(equity: pd.Series):
@@ -191,7 +223,7 @@ def build_report(all_results: dict, notes: list[str]):
         html = f"""<!doctype html><html><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Intraday Backtests</title></head><body style="font-family:system-ui;margin:16px">
-        <h2>Intraday Backtests (5-min) - auto report</h2>
+        <h2>Intraday Backtests (5-min) — auto report</h2>
         <p>Generated: {now}</p>
         <ul>{notes_html}</ul>
         <p>No results (data unavailable or rate limited). Try again later.</p>
@@ -201,10 +233,11 @@ def build_report(all_results: dict, notes: list[str]):
         return
 
     table_rows = "\n".join([
-        f"<tr><td>{t}</td><td>{s}</td><td>{r}</td><td>{m}</td><td>{tr}</td><td><img src='assets/{img}' width='380'></td></tr>"
+        f"<tr><td>{t}</td><td>{s}</td><td>{r}</td><td>{m}</td><td>{tr}</td><td><img src='assets/{img}' width='360'></td></tr>"
         for (t,s,r,m,tr,img) in rows
     ])
-    html = f"""<!doctype html>
+    html = f"""
+<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -215,6 +248,7 @@ body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-ser
 table {{ border-collapse: collapse; width: 100%; }}
 th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
 th {{ background: #f5f5f5; }}
+td img {{ max-width: 100%; height: auto; }}
 </style>
 </head>
 <body>
@@ -227,7 +261,7 @@ th {{ background: #f5f5f5; }}
 {table_rows}
 </tbody>
 </table>
-<p>Data sources: Yahoo Finance via yfinance (primary), Alpha Vantage fallback (5min). Execution: next bar open, 1bps slippage, 0.5 commission.</p>
+<p>Data sources: Yahoo Finance (primary), Alpha Vantage fallback (equity/crypto/FX 5min). Execution: next bar open, 1bps slippage, 0.5 commission.</p>
 </body>
 </html>
 """
@@ -241,7 +275,7 @@ def main():
         if idx > 0:
             time.sleep(10 + random.randint(0, 10))
         df = dl_5m(ticker)
-        cache_path = os.path.join(DATA_DIR, f"{ticker}_5m.csv")
+        cache_path = os.path.join(DATA_DIR, f"{ticker.replace('=','_')}_5m.csv")
         used_cache = False
         if (df is None or df.empty) and os.path.exists(cache_path):
             df = pd.read_csv(cache_path, parse_dates=["datetime"])
@@ -251,16 +285,15 @@ def main():
             notes.append(f"{ticker}: no data available (APIs failed and no cache).")
             continue
         df.to_csv(cache_path, index=False)
-        if used_cache:
-            notes.append(f"{ticker}: reusing cached data for backtest.")
-        results = run_backtest(ticker, df)
-        for strat_name, res in results.items():
+        res_dict = run_backtest(ticker, df)
+        for strat_name, res in res_dict.items():
             key = f"{ticker}__{strat_name}"
             summary[key] = res
             img_path = os.path.join(ASSET_DIR, f"{ticker}_{strat_name}_equity.png")
             plot_equity(res['equity_curve'], f"{ticker} — {strat_name}", img_path)
     build_report(summary, notes)
     print("Done. Report at docs/index.html")
+
 
 if __name__ == "__main__":
     main()
